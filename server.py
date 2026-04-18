@@ -1,5 +1,5 @@
 """
-FastAPI Video Receiver & Playback Server - COOKIE AUTH FIX
+FastAPI Video Receiver & Playback Server - FIXED sqlite3.Row access
 """
 
 import os
@@ -117,16 +117,13 @@ async def get_current_user(
     session_token: Optional[str] = Cookie(None, alias="session_token")
 ):
     """Get user from header OR query parameter OR cookie"""
-    # Try header first
     token = None
     if credentials:
         token = credentials.credentials
     
-    # Fallback to query parameter
     if not token and token_query:
         token = token_query
     
-    # Fallback to cookie
     if not token and session_token:
         token = session_token
     
@@ -157,7 +154,7 @@ class LoginRequest(BaseModel):
 app = FastAPI(
     title="ESP32-CAM Video Server",
     description="Receive and store videos from ESP32-CAM",
-    version="2.2.0"
+    version="2.2.1"
 )
 
 app.add_middleware(
@@ -269,7 +266,7 @@ LOGIN_PAGE = """
                     username: document.getElementById('username').value,
                     password: document.getElementById('password').value
                 }),
-                credentials: 'include'  // Important: include cookies
+                credentials: 'include'
             });
             if (res.ok) {
                 const data = await res.json();
@@ -415,11 +412,10 @@ DASHBOARD_PAGE = """
         <div id="videosContainer"><div class="empty-state">Loading...</div></div>
     </div>
     <script>
-        // Check if we have a token or cookie
         const token = localStorage.getItem('token');
         
         async function apiFetch(url, opts = {}) {
-            opts.credentials = 'include'; // Always send cookies
+            opts.credentials = 'include';
             opts.headers = {
                 ...opts.headers,
                 'Authorization': `Bearer ${token || ''}`
@@ -487,7 +483,6 @@ DASHBOARD_PAGE = """
                     const typeBadge = isVideo ? '<span class="badge badge-video">VIDEO</span>' : '<span class="badge badge-image">IMAGE</span>';
                     const durationInfo = video.duration_seconds ? `<div>Duration: <span>${video.duration_seconds}s</span></div>` : '';
                     
-                    // Use cookie auth - no token in URL needed!
                     const streamUrl = `/api/videos/${video.id}/stream`;
                     
                     if (isVideo) {
@@ -582,14 +577,13 @@ async def api_login(creds: LoginRequest, response: Response):
     
     token = token_manager.create_token(user["username"])
     
-    # Set cookie for video streaming
     response.set_cookie(
         key="session_token",
         value=token,
         httponly=True,
-        max_age=86400,  # 24 hours
+        max_age=86400,
         samesite="lax",
-        secure=True  # Required for HTTPS on Render
+        secure=True
     )
     
     return {"token": token, "username": user["username"]}
@@ -736,7 +730,8 @@ async def stream_video(
     file_path = video["storage_path"]
     file_size = os.path.getsize(file_path)
     
-    content_type = video.get("content_type") or "application/octet-stream"
+    # FIX: Access sqlite3.Row by key indexing, not .get()
+    content_type = video["content_type"] or "application/octet-stream"
     if not content_type or content_type == "null":
         if file_path.endswith('.webm'):
             content_type = "video/webm"
