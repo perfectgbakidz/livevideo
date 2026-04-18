@@ -1,5 +1,5 @@
 """
-FastAPI Video Receiver & Playback Server - FIXED TOKEN & VIDEO
+FastAPI Video Receiver & Playback Server - COOKIE AUTH FIX
 """
 
 import os
@@ -9,9 +9,9 @@ import datetime
 from typing import Optional
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request, File, UploadFile, Form, Query
+from fastapi import FastAPI, HTTPException, Depends, status, Request, File, UploadFile, Form, Query, Cookie
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import argon2
@@ -113,9 +113,10 @@ token_manager = TokenManager()
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    token_query: Optional[str] = Query(None, alias="token")
+    token_query: Optional[str] = Query(None, alias="token"),
+    session_token: Optional[str] = Cookie(None, alias="session_token")
 ):
-    """Get user from header OR query parameter"""
+    """Get user from header OR query parameter OR cookie"""
     # Try header first
     token = None
     if credentials:
@@ -124,6 +125,10 @@ async def get_current_user(
     # Fallback to query parameter
     if not token and token_query:
         token = token_query
+    
+    # Fallback to cookie
+    if not token and session_token:
+        token = session_token
     
     if not token:
         raise HTTPException(
@@ -152,7 +157,7 @@ class LoginRequest(BaseModel):
 app = FastAPI(
     title="ESP32-CAM Video Server",
     description="Receive and store videos from ESP32-CAM",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -263,7 +268,8 @@ LOGIN_PAGE = """
                 body: JSON.stringify({
                     username: document.getElementById('username').value,
                     password: document.getElementById('password').value
-                })
+                }),
+                credentials: 'include'  // Important: include cookies
             });
             if (res.ok) {
                 const data = await res.json();
@@ -380,7 +386,6 @@ DASHBOARD_PAGE = """
         .badge-video { background: #e74c3c; }
         .badge-image { background: #3498db; }
         .empty-state { text-align: center; padding: 4rem; color: #888; }
-        .error-box { background: rgba(231, 76, 60, 0.2); padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     </style>
 </head>
 <body>
@@ -410,20 +415,16 @@ DASHBOARD_PAGE = """
         <div id="videosContainer"><div class="empty-state">Loading...</div></div>
     </div>
     <script>
+        // Check if we have a token or cookie
         const token = localStorage.getItem('token');
-        if (!token) window.location.href = '/login';
         
         async function apiFetch(url, opts = {}) {
-            // Always include token in both header and query for compatibility
-            const separator = url.includes('?') ? '&' : '?';
-            const urlWithToken = `${url}${separator}token=${token}`;
-            
+            opts.credentials = 'include'; // Always send cookies
             opts.headers = {
                 ...opts.headers,
-                'Authorization': `Bearer ${token}`
+                'Authorization': `Bearer ${token || ''}`
             };
-            
-            const res = await fetch(urlWithToken, opts);
+            const res = await fetch(url, opts);
             if (res.status === 401 || res.status === 403) {
                 console.error('Auth failed, redirecting to login');
                 logout();
@@ -486,6 +487,7 @@ DASHBOARD_PAGE = """
                     const typeBadge = isVideo ? '<span class="badge badge-video">VIDEO</span>' : '<span class="badge badge-image">IMAGE</span>';
                     const durationInfo = video.duration_seconds ? `<div>Duration: <span>${video.duration_seconds}s</span></div>` : '';
                     
+                    // Use cookie auth - no token in URL needed!
                     const streamUrl = `/api/videos/${video.id}/stream`;
                     
                     if (isVideo) {
@@ -528,7 +530,8 @@ DASHBOARD_PAGE = """
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        function logout() {
+        async function logout() {
+            await fetch('/api/logout', { credentials: 'include' });
             localStorage.removeItem('token');
             window.location.href = '/login';
         }
@@ -567,7 +570,7 @@ async def options_upload_frame():
     )
 
 @app.post("/api/login")
-async def api_login(creds: LoginRequest):
+async def api_login(creds: LoginRequest, response: Response):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE username = ?", (creds.username,))
@@ -577,7 +580,24 @@ async def api_login(creds: LoginRequest):
     if not user or not verify_password(creds.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    return {"token": token_manager.create_token(user["username"]), "username": user["username"]}
+    token = token_manager.create_token(user["username"])
+    
+    # Set cookie for video streaming
+    response.set_cookie(
+        key="session_token",
+        value=token,
+        httponly=True,
+        max_age=86400,  # 24 hours
+        samesite="lax",
+        secure=True  # Required for HTTPS on Render
+    )
+    
+    return {"token": token, "username": user["username"]}
+
+@app.post("/api/logout")
+async def api_logout(response: Response):
+    response.delete_cookie("session_token")
+    return {"message": "Logged out"}
 
 @app.get("/api/me")
 async def api_me(username: str = Depends(get_current_user)):
@@ -602,7 +622,6 @@ async def upload_frame(request: Request):
         resolution = headers.get("x-resolution", "unknown")
         duration = headers.get("x-video-duration", "0")
         
-        # Parse timestamp
         if timestamp_str:
             try:
                 timestamp_str = timestamp_str.replace('Z', '+00:00')
@@ -615,7 +634,6 @@ async def upload_frame(request: Request):
         if timestamp.tzinfo:
             timestamp = timestamp.replace(tzinfo=None)
         
-        # Determine if video or image
         is_video = 'video' in content_type.lower()
         ext = '.webm' if is_video else '.jpg'
         
@@ -699,10 +717,10 @@ async def list_videos(username: str = Depends(get_current_user)):
 @app.get("/api/videos/{video_id}/stream")
 async def stream_video(
     video_id: int, 
-    token: Optional[str] = Query(None),
+    request: Request,
     username: str = Depends(get_current_user)
 ):
-    """Stream video file - supports both header and query token"""
+    """Stream video file - uses cookie auth so <video> tags work seamlessly"""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -718,7 +736,6 @@ async def stream_video(
     file_path = video["storage_path"]
     file_size = os.path.getsize(file_path)
     
-    # Determine content type from file extension if not set
     content_type = video.get("content_type") or "application/octet-stream"
     if not content_type or content_type == "null":
         if file_path.endswith('.webm'):
@@ -728,7 +745,7 @@ async def stream_video(
         else:
             content_type = "image/jpeg"
     
-    print(f"Streaming video {video_id}: {file_path} ({file_size} bytes) as {content_type}")
+    print(f"Streaming video {video_id}: {file_path} ({file_size} bytes) as {content_type} for user {username}")
     
     def iterfile():
         with open(file_path, "rb") as f:
@@ -740,19 +757,20 @@ async def stream_video(
         headers={
             "Accept-Ranges": "bytes",
             "Content-Length": str(file_size),
+            "Cache-Control": "no-cache",
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache"
+            "Access-Control-Allow-Credentials": "true"
         }
     )
 
 @app.get("/api/videos/{video_id}/thumbnail")
 async def get_thumbnail(
-    video_id: int, 
-    token: Optional[str] = Query(None),
+    video_id: int,
+    request: Request,
     username: str = Depends(get_current_user)
 ):
     """Return thumbnail for video or the image itself"""
-    return await stream_video(video_id, token, username)
+    return await stream_video(video_id, request, username)
 
 @app.get("/health")
 async def health_check():
