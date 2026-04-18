@@ -1,5 +1,6 @@
 """
 FastAPI Video Receiver & Playback Server for Render Deployment
+Fixed CORS and route issues
 """
 
 import os
@@ -11,29 +12,24 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request, File, UploadFile, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import argon2
 
 # ==================== CONFIGURATION ====================
 
-# Use environment variables for Render deployment
-DATABASE = "/tmp/videos.db"  # Render's ephemeral storage path
-VIDEO_STORAGE = "/tmp/video_storage"  # Use /tmp for free tier (ephemeral)
+DATABASE = "/tmp/videos.db"
+VIDEO_STORAGE = "/tmp/video_storage"
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # CHANGE THIS IN RENDER DASHBOARD!
-
-# For persistent storage on Render, use a disk (paid) or external service
-# Free tier: /tmp is wiped on restart, but works for testing
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 os.makedirs(VIDEO_STORAGE, exist_ok=True)
 
 # ==================== DATABASE SETUP ====================
 
 def init_db():
-    """Initialize SQLite database"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
@@ -137,13 +133,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS for ESP32-CAM access
+# CRITICAL: CORS must be added BEFORE routes
+# Allow all origins for ESP32-CAM access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict this in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 @app.on_event("startup")
@@ -479,6 +478,18 @@ async def dashboard_page():
 async def root():
     return RedirectResponse(url="/login")
 
+# CRITICAL: Add OPTIONS handler for CORS preflight
+@app.options("/api/upload/frame")
+async def options_upload_frame():
+    return JSONResponse(
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
 @app.post("/api/login")
 async def api_login(creds: LoginRequest):
     conn = get_db()
@@ -499,46 +510,81 @@ async def api_me(username: str = Depends(get_current_user)):
 @app.post("/api/upload/frame")
 async def upload_frame(request: Request):
     """Receive raw JPEG frame from ESP32-CAM"""
-    body = await request.body()
-    if len(body) < 100:
-        raise HTTPException(status_code=400, detail="Invalid image data")
-    
-    headers = request.headers
-    device_id = headers.get("x-device-id", "esp32-cam-001")
-    timestamp_str = headers.get("x-timestamp")
-    resolution = headers.get("x-resolution", "unknown")
-    
-    if timestamp_str:
-        try:
-            timestamp = datetime.datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except:
+    try:
+        body = await request.body()
+        
+        # Debug logging
+        print(f"Received frame: {len(body)} bytes")
+        print(f"Headers: {dict(request.headers)}")
+        
+        if len(body) < 100:
+            raise HTTPException(status_code=400, detail="Invalid image data - too small")
+        
+        headers = request.headers
+        device_id = headers.get("x-device-id", "esp32-cam-001")
+        timestamp_str = headers.get("x-timestamp")
+        resolution = headers.get("x-resolution", "unknown")
+        
+        # Parse timestamp
+        if timestamp_str:
+            try:
+                # Handle ISO format with Z
+                timestamp_str = timestamp_str.replace('Z', '+00:00')
+                timestamp = datetime.datetime.fromisoformat(timestamp_str)
+            except Exception as e:
+                print(f"Timestamp parse error: {e}, using now")
+                timestamp = datetime.datetime.now()
+        else:
             timestamp = datetime.datetime.now()
-    else:
-        timestamp = datetime.datetime.now()
-    
-    date_folder = timestamp.strftime("%Y-%m-%d")
-    time_str = timestamp.strftime("%H-%M-%S-%f")[:-3]
-    filename = f"{device_id}_{time_str}.jpg"
-    
-    storage_dir = os.path.join(VIDEO_STORAGE, date_folder)
-    os.makedirs(storage_dir, exist_ok=True)
-    storage_path = os.path.join(storage_dir, filename)
-    
-    with open(storage_path, "wb") as f:
-        f.write(body)
-    
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO videos (device_id, filename, storage_path, file_size, recorded_date, recorded_time, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (device_id, filename, storage_path, len(body), timestamp.date().isoformat(), 
-          timestamp.time().isoformat(), f"{{'resolution': '{resolution}'}}"))
-    video_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    return {"success": True, "id": video_id, "filename": filename}
+        
+        # Ensure timestamp is timezone-naive for storage
+        if timestamp.tzinfo:
+            timestamp = timestamp.replace(tzinfo=None)
+        
+        date_folder = timestamp.strftime("%Y-%m-%d")
+        time_str = timestamp.strftime("%H-%M-%S-%f")[:-3]
+        filename = f"{device_id}_{time_str}.jpg"
+        
+        storage_dir = os.path.join(VIDEO_STORAGE, date_folder)
+        os.makedirs(storage_dir, exist_ok=True)
+        storage_path = os.path.join(storage_dir, filename)
+        
+        with open(storage_path, "wb") as f:
+            f.write(body)
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO videos (device_id, filename, storage_path, file_size, recorded_date, recorded_time, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            device_id, 
+            filename, 
+            storage_path, 
+            len(body), 
+            timestamp.date().isoformat(),
+            timestamp.time().isoformat(), 
+            f"{{'resolution': '{resolution}', 'source': 'esp32-cam'}}"
+        ))
+        video_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        print(f"Saved video {video_id}: {filename} ({len(body)} bytes)")
+        
+        return JSONResponse(
+            content={
+                "success": True, 
+                "id": video_id, 
+                "filename": filename,
+                "size": len(body)
+            },
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+        
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/api/videos")
 async def list_videos(username: str = Depends(get_current_user)):
@@ -557,9 +603,12 @@ async def list_videos(username: str = Depends(get_current_user)):
         if date not in videos_by_date:
             videos_by_date[date] = []
         videos_by_date[date].append({
-            "id": video["id"], "device_id": video["device_id"],
-            "filename": video["filename"], "file_size": video["file_size"],
-            "recorded_time": video["recorded_time"], "created_at": video["created_at"]
+            "id": video["id"], 
+            "device_id": video["device_id"],
+            "filename": video["filename"], 
+            "file_size": video["file_size"],
+            "recorded_time": video["recorded_time"], 
+            "created_at": video["created_at"]
         })
     
     return {"total_videos": len(videos), "videos_by_date": videos_by_date}
@@ -572,14 +621,29 @@ async def stream_video(video_id: int, token: Optional[str] = None, username: str
     video = cursor.fetchone()
     conn.close()
     
-    if not video or not os.path.exists(video["storage_path"]):
-        raise HTTPException(status_code=404, detail="Video not found")
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found in database")
+    
+    if not os.path.exists(video["storage_path"]):
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
     
     def iterfile():
         with open(video["storage_path"], "rb") as f:
             yield from f
     
-    return StreamingResponse(iterfile(), media_type="image/jpeg")
+    return StreamingResponse(
+        iterfile(), 
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
+# Health check endpoint for Render
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
