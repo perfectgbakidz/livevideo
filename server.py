@@ -1,6 +1,5 @@
 """
-FastAPI Video Receiver & Playback Server for Render Deployment
-Fixed CORS and route issues
+FastAPI Video Receiver & Playback Server - VIDEO SUPPORT
 """
 
 import os
@@ -49,6 +48,8 @@ def init_db():
             filename TEXT NOT NULL,
             storage_path TEXT NOT NULL,
             file_size INTEGER,
+            content_type TEXT DEFAULT 'image/jpeg',
+            duration_seconds REAL DEFAULT 0,
             recorded_date DATE NOT NULL,
             recorded_time TIME NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -130,11 +131,9 @@ class LoginRequest(BaseModel):
 app = FastAPI(
     title="ESP32-CAM Video Server",
     description="Receive and store videos from ESP32-CAM",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# CRITICAL: CORS must be added BEFORE routes
-# Allow all origins for ESP32-CAM access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -323,7 +322,7 @@ DASHBOARD_PAGE = """
         }
         .video-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
             gap: 1rem;
         }
         .video-card {
@@ -331,12 +330,18 @@ DASHBOARD_PAGE = """
             border-radius: 8px;
             overflow: hidden;
         }
+        .video-card video {
+            width: 100%;
+            height: 240px;
+            background: #000;
+            display: block;
+        }
         .video-card img {
             width: 100%;
-            height: 200px;
+            height: 240px;
             object-fit: cover;
             background: #000;
-            cursor: pointer;
+            display: block;
         }
         .video-info {
             padding: 1rem;
@@ -344,6 +349,15 @@ DASHBOARD_PAGE = """
         }
         .video-info div { margin: 0.25rem 0; color: #aaa; }
         .video-info span { color: #fff; }
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-left: 0.5rem;
+        }
+        .badge-video { background: #e74c3c; }
+        .badge-image { background: #3498db; }
         .empty-state { text-align: center; padding: 4rem; color: #888; }
     </style>
 </head>
@@ -360,7 +374,7 @@ DASHBOARD_PAGE = """
         <div class="stats">
             <div class="stat-card">
                 <div class="stat-value" id="totalVideos">0</div>
-                <div class="stat-label">Total Videos</div>
+                <div class="stat-label">Total Clips</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value" id="totalDays">0</div>
@@ -428,16 +442,36 @@ DASHBOARD_PAGE = """
                 videos.forEach(video => {
                     const card = document.createElement('div');
                     card.className = 'video-card';
-                    card.innerHTML = `
-                        <img src="/api/videos/${video.id}/stream?token=${token}" 
-                             onclick="window.open(this.src, '_blank')" 
-                             alt="${video.filename}">
-                        <div class="video-info">
-                            <div>Time: <span>${video.recorded_time}</span></div>
-                            <div>Device: <span>${video.device_id}</span></div>
-                            <div>Size: <span>${formatBytes(video.file_size)}</span></div>
-                        </div>
-                    `;
+                    
+                    const isVideo = video.content_type && video.content_type.includes('video');
+                    const typeBadge = isVideo ? '<span class="badge badge-video">VIDEO</span>' : '<span class="badge badge-image">IMAGE</span>';
+                    const durationInfo = video.duration_seconds ? `<div>Duration: <span>${video.duration_seconds}s</span></div>` : '';
+                    
+                    if (isVideo) {
+                        card.innerHTML = `
+                            <video controls preload="metadata" poster="/api/videos/${video.id}/thumbnail?token=${token}">
+                                <source src="/api/videos/${video.id}/stream?token=${token}" type="${video.content_type}">
+                                Your browser does not support the video tag.
+                            </video>
+                            <div class="video-info">
+                                <div>Time: <span>${video.recorded_time}</span> ${typeBadge}</div>
+                                <div>Device: <span>${video.device_id}</span></div>
+                                ${durationInfo}
+                                <div>Size: <span>${formatBytes(video.file_size)}</span></div>
+                            </div>
+                        `;
+                    } else {
+                        card.innerHTML = `
+                            <img src="/api/videos/${video.id}/stream?token=${token}" 
+                                 onclick="window.open(this.src, '_blank')" 
+                                 alt="${video.filename}">
+                            <div class="video-info">
+                                <div>Time: <span>${video.recorded_time}</span> ${typeBadge}</div>
+                                <div>Device: <span>${video.device_id}</span></div>
+                                <div>Size: <span>${formatBytes(video.file_size)}</span></div>
+                            </div>
+                        `;
+                    }
                     grid.appendChild(card);
                 });
             });
@@ -446,7 +480,7 @@ DASHBOARD_PAGE = """
         function formatBytes(bytes) {
             if (!bytes) return '0 Bytes';
             const k = 1024;
-            const sizes = ['Bytes', 'KB', 'MB'];
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
@@ -478,7 +512,6 @@ async def dashboard_page():
 async def root():
     return RedirectResponse(url="/login")
 
-# CRITICAL: Add OPTIONS handler for CORS preflight
 @app.options("/api/upload/frame")
 async def options_upload_frame():
     return JSONResponse(
@@ -507,43 +540,45 @@ async def api_login(creds: LoginRequest):
 async def api_me(username: str = Depends(get_current_user)):
     return {"username": username}
 
+# ==================== VIDEO UPLOAD ENDPOINTS ====================
+
 @app.post("/api/upload/frame")
 async def upload_frame(request: Request):
-    """Receive raw JPEG frame from ESP32-CAM"""
+    """Receive raw frame (JPEG or Video) from ESP32-CAM"""
     try:
         body = await request.body()
-        
-        # Debug logging
-        print(f"Received frame: {len(body)} bytes")
-        print(f"Headers: {dict(request.headers)}")
+        print(f"Received data: {len(body)} bytes")
         
         if len(body) < 100:
-            raise HTTPException(status_code=400, detail="Invalid image data - too small")
+            raise HTTPException(status_code=400, detail="Invalid data - too small")
         
         headers = request.headers
+        content_type = headers.get("content-type", "image/jpeg")
         device_id = headers.get("x-device-id", "esp32-cam-001")
         timestamp_str = headers.get("x-timestamp")
         resolution = headers.get("x-resolution", "unknown")
+        duration = headers.get("x-video-duration", "0")
         
         # Parse timestamp
         if timestamp_str:
             try:
-                # Handle ISO format with Z
                 timestamp_str = timestamp_str.replace('Z', '+00:00')
                 timestamp = datetime.datetime.fromisoformat(timestamp_str)
-            except Exception as e:
-                print(f"Timestamp parse error: {e}, using now")
+            except:
                 timestamp = datetime.datetime.now()
         else:
             timestamp = datetime.datetime.now()
         
-        # Ensure timestamp is timezone-naive for storage
         if timestamp.tzinfo:
             timestamp = timestamp.replace(tzinfo=None)
         
+        # Determine if video or image
+        is_video = 'video' in content_type.lower()
+        ext = '.webm' if is_video else '.jpg'
+        
         date_folder = timestamp.strftime("%Y-%m-%d")
         time_str = timestamp.strftime("%H-%M-%S-%f")[:-3]
-        filename = f"{device_id}_{time_str}.jpg"
+        filename = f"{device_id}_{time_str}{ext}"
         
         storage_dir = os.path.join(VIDEO_STORAGE, date_folder)
         os.makedirs(storage_dir, exist_ok=True)
@@ -555,13 +590,15 @@ async def upload_frame(request: Request):
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO videos (device_id, filename, storage_path, file_size, recorded_date, recorded_time, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO videos (device_id, filename, storage_path, file_size, content_type, duration_seconds, recorded_date, recorded_time, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             device_id, 
             filename, 
             storage_path, 
-            len(body), 
+            len(body),
+            content_type,
+            float(duration) if duration else 0,
             timestamp.date().isoformat(),
             timestamp.time().isoformat(), 
             f"{{'resolution': '{resolution}', 'source': 'esp32-cam'}}"
@@ -570,13 +607,14 @@ async def upload_frame(request: Request):
         conn.commit()
         conn.close()
         
-        print(f"Saved video {video_id}: {filename} ({len(body)} bytes)")
+        print(f"Saved {'video' if is_video else 'image'} {video_id}: {filename} ({len(body)} bytes)")
         
         return JSONResponse(
             content={
                 "success": True, 
                 "id": video_id, 
                 "filename": filename,
+                "type": "video" if is_video else "image",
                 "size": len(body)
             },
             headers={"Access-Control-Allow-Origin": "*"}
@@ -591,7 +629,7 @@ async def list_videos(username: str = Depends(get_current_user)):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, device_id, filename, file_size, recorded_date, recorded_time, created_at
+        SELECT id, device_id, filename, file_size, content_type, duration_seconds, recorded_date, recorded_time, created_at
         FROM videos ORDER BY recorded_date DESC, recorded_time DESC
     """)
     videos = cursor.fetchall()
@@ -607,6 +645,8 @@ async def list_videos(username: str = Depends(get_current_user)):
             "device_id": video["device_id"],
             "filename": video["filename"], 
             "file_size": video["file_size"],
+            "content_type": video["content_type"],
+            "duration_seconds": video["duration_seconds"],
             "recorded_time": video["recorded_time"], 
             "created_at": video["created_at"]
         })
@@ -631,16 +671,26 @@ async def stream_video(video_id: int, token: Optional[str] = None, username: str
         with open(video["storage_path"], "rb") as f:
             yield from f
     
+    # Determine content type
+    content_type = video.get("content_type", "image/jpeg")
+    if not content_type or content_type == "null":
+        content_type = "image/jpeg"
+    
     return StreamingResponse(
         iterfile(), 
-        media_type="image/jpeg",
+        media_type=content_type,
         headers={
             "Cache-Control": "no-cache",
-            "Access-Control-Allow-Origin": "*"
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes"
         }
     )
 
-# Health check endpoint for Render
+@app.get("/api/videos/{video_id}/thumbnail")
+async def get_thumbnail(video_id: int, token: Optional[str] = None, username: str = Depends(get_current_user)):
+    """Return thumbnail for video (first frame) or the image itself"""
+    return await stream_video(video_id, token, username)
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "timestamp": datetime.datetime.now().isoformat()}
