@@ -1,5 +1,5 @@
 """
-FastAPI Video Receiver & Playback Server - VIDEO SUPPORT
+FastAPI Video Receiver & Playback Server - FIXED TOKEN & VIDEO
 """
 
 import os
@@ -9,9 +9,9 @@ import datetime
 from typing import Optional
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Depends, status, Request, File, UploadFile, Form, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import argon2
@@ -84,7 +84,7 @@ def verify_password(password: str, hash: str) -> bool:
 
 # ==================== AUTHENTICATION ====================
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 class TokenManager:
     def __init__(self):
@@ -99,6 +99,8 @@ class TokenManager:
         return token
     
     def verify_token(self, token: str) -> Optional[str]:
+        if not token:
+            return None
         if token in self.tokens:
             age = datetime.datetime.now() - self.tokens[token]["created"]
             if age.total_seconds() < 86400:
@@ -109,8 +111,27 @@ class TokenManager:
 
 token_manager = TokenManager()
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    token_query: Optional[str] = Query(None, alias="token")
+):
+    """Get user from header OR query parameter"""
+    # Try header first
+    token = None
+    if credentials:
+        token = credentials.credentials
+    
+    # Fallback to query parameter
+    if not token and token_query:
+        token = token_query
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No token provided",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     username = token_manager.verify_token(token)
     if not username:
         raise HTTPException(
@@ -131,7 +152,7 @@ class LoginRequest(BaseModel):
 app = FastAPI(
     title="ESP32-CAM Video Server",
     description="Receive and store videos from ESP32-CAM",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -359,6 +380,7 @@ DASHBOARD_PAGE = """
         .badge-video { background: #e74c3c; }
         .badge-image { background: #3498db; }
         .empty-state { text-align: center; padding: 4rem; color: #888; }
+        .error-box { background: rgba(231, 76, 60, 0.2); padding: 1rem; border-radius: 8px; margin: 1rem 0; }
     </style>
 </head>
 <body>
@@ -392,9 +414,21 @@ DASHBOARD_PAGE = """
         if (!token) window.location.href = '/login';
         
         async function apiFetch(url, opts = {}) {
-            opts.headers = { ...opts.headers, 'Authorization': `Bearer ${token}` };
-            const res = await fetch(url, opts);
-            if (res.status === 401) { logout(); return null; }
+            // Always include token in both header and query for compatibility
+            const separator = url.includes('?') ? '&' : '?';
+            const urlWithToken = `${url}${separator}token=${token}`;
+            
+            opts.headers = {
+                ...opts.headers,
+                'Authorization': `Bearer ${token}`
+            };
+            
+            const res = await fetch(urlWithToken, opts);
+            if (res.status === 401 || res.status === 403) {
+                console.error('Auth failed, redirecting to login');
+                logout();
+                return null;
+            }
             return res;
         }
         
@@ -443,14 +477,22 @@ DASHBOARD_PAGE = """
                     const card = document.createElement('div');
                     card.className = 'video-card';
                     
-                    const isVideo = video.content_type && video.content_type.includes('video');
+                    const isVideo = video.content_type && (
+                        video.content_type.includes('video') || 
+                        video.filename.endsWith('.webm') ||
+                        video.filename.endsWith('.mp4')
+                    );
+                    
                     const typeBadge = isVideo ? '<span class="badge badge-video">VIDEO</span>' : '<span class="badge badge-image">IMAGE</span>';
                     const durationInfo = video.duration_seconds ? `<div>Duration: <span>${video.duration_seconds}s</span></div>` : '';
                     
+                    const streamUrl = `/api/videos/${video.id}/stream`;
+                    
                     if (isVideo) {
                         card.innerHTML = `
-                            <video controls preload="metadata" poster="/api/videos/${video.id}/thumbnail?token=${token}">
-                                <source src="/api/videos/${video.id}/stream?token=${token}" type="${video.content_type}">
+                            <video controls preload="metadata" muted playsinline>
+                                <source src="${streamUrl}" type="video/webm">
+                                <source src="${streamUrl}" type="video/mp4">
                                 Your browser does not support the video tag.
                             </video>
                             <div class="video-info">
@@ -458,11 +500,12 @@ DASHBOARD_PAGE = """
                                 <div>Device: <span>${video.device_id}</span></div>
                                 ${durationInfo}
                                 <div>Size: <span>${formatBytes(video.file_size)}</span></div>
+                                <div><a href="${streamUrl}" target="_blank" style="color: #667eea;">Open Video ↗</a></div>
                             </div>
                         `;
                     } else {
                         card.innerHTML = `
-                            <img src="/api/videos/${video.id}/stream?token=${token}" 
+                            <img src="${streamUrl}" 
                                  onclick="window.open(this.src, '_blank')" 
                                  alt="${video.filename}">
                             <div class="video-info">
@@ -654,7 +697,12 @@ async def list_videos(username: str = Depends(get_current_user)):
     return {"total_videos": len(videos), "videos_by_date": videos_by_date}
 
 @app.get("/api/videos/{video_id}/stream")
-async def stream_video(video_id: int, token: Optional[str] = None, username: str = Depends(get_current_user)):
+async def stream_video(
+    video_id: int, 
+    token: Optional[str] = Query(None),
+    username: str = Depends(get_current_user)
+):
+    """Stream video file - supports both header and query token"""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM videos WHERE id = ?", (video_id,))
@@ -667,28 +715,43 @@ async def stream_video(video_id: int, token: Optional[str] = None, username: str
     if not os.path.exists(video["storage_path"]):
         raise HTTPException(status_code=404, detail="Video file not found on disk")
     
-    def iterfile():
-        with open(video["storage_path"], "rb") as f:
-            yield from f
+    file_path = video["storage_path"]
+    file_size = os.path.getsize(file_path)
     
-    # Determine content type
-    content_type = video.get("content_type", "image/jpeg")
+    # Determine content type from file extension if not set
+    content_type = video.get("content_type") or "application/octet-stream"
     if not content_type or content_type == "null":
-        content_type = "image/jpeg"
+        if file_path.endswith('.webm'):
+            content_type = "video/webm"
+        elif file_path.endswith('.mp4'):
+            content_type = "video/mp4"
+        else:
+            content_type = "image/jpeg"
+    
+    print(f"Streaming video {video_id}: {file_path} ({file_size} bytes) as {content_type}")
+    
+    def iterfile():
+        with open(file_path, "rb") as f:
+            yield from f
     
     return StreamingResponse(
         iterfile(), 
         media_type=content_type,
         headers={
-            "Cache-Control": "no-cache",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
             "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes"
+            "Cache-Control": "no-cache"
         }
     )
 
 @app.get("/api/videos/{video_id}/thumbnail")
-async def get_thumbnail(video_id: int, token: Optional[str] = None, username: str = Depends(get_current_user)):
-    """Return thumbnail for video (first frame) or the image itself"""
+async def get_thumbnail(
+    video_id: int, 
+    token: Optional[str] = Query(None),
+    username: str = Depends(get_current_user)
+):
+    """Return thumbnail for video or the image itself"""
     return await stream_video(video_id, token, username)
 
 @app.get("/health")
